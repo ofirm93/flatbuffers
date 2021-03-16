@@ -143,8 +143,7 @@ void Parser::Message(const std::string &msg) {
 }
 
 void Parser::Warning(const std::string &msg) {
-  if (!opts.no_warnings)
-    Message("warning: " + msg);
+  if (!opts.no_warnings) Message("warning: " + msg);
 }
 
 CheckedError Parser::Error(const std::string &msg) {
@@ -203,8 +202,7 @@ bool atot_scalar(const char *s, T *val, bool_constant<true>) {
   return true;
 }
 
-template<typename T>
-CheckedError atot(const char *s, Parser &parser, T *val) {
+template<typename T> CheckedError atot(const char *s, Parser &parser, T *val) {
   auto done = atot_scalar(s, val, bool_constant<is_floating_point<T>::value>());
   if (done) return NoError();
   if (0 == *val)
@@ -227,14 +225,38 @@ std::string Namespace::GetFullyQualifiedName(const std::string &name,
   if (components.empty() || !max_components) { return name; }
   std::string stream_str;
   for (size_t i = 0; i < std::min(components.size(), max_components); i++) {
-    if (i) { stream_str += '.'; }
-    stream_str += std::string(components[i]);
+    stream_str += components[i];
+    stream_str += '.';
   }
+  if (!stream_str.empty()) stream_str.pop_back();
   if (name.length()) {
     stream_str += '.';
     stream_str += name;
   }
   return stream_str;
+}
+
+template<typename T>
+T *LookupTableByName(const SymbolTable<T> &table, const std::string &name,
+                     const Namespace &current_namespace, size_t skip_top) {
+  const auto &components = current_namespace.components;
+  if (table.dict.empty()) return nullptr;
+  if (components.size() < skip_top) return nullptr;
+  const auto N = components.size() - skip_top;
+  std::string full_name;
+  for (size_t i = 0; i < N; i++) {
+    full_name += components[i];
+    full_name += '.';
+  }
+  for (size_t i = N; i > 0; i--) {
+    full_name += name;
+    auto obj = table.Lookup(full_name);
+    if (obj) return obj;
+    auto len = full_name.size() - components[i - 1].size() - 1 - name.size();
+    full_name.resize(len);
+  }
+  FLATBUFFERS_ASSERT(full_name.empty());
+  return table.Lookup(name);  // lookup in global namespace
 }
 
 // Declare tokens we'll use. Single character tokens are represented by their
@@ -476,15 +498,19 @@ CheckedError Parser::Next() {
         }
         FLATBUFFERS_FALLTHROUGH();  // else fall thru
       default:
-        const auto has_sign = (c == '+') || (c == '-');
-        // '-'/'+' and following identifier - can be a predefined constant like:
-        // NAN, INF, PI, etc or it can be a function name like cos/sin/deg.
-        if (IsIdentifierStart(c) || (has_sign && IsIdentifierStart(*cursor_))) {
+        if (IsIdentifierStart(c)) {
           // Collect all chars of an identifier:
           const char *start = cursor_ - 1;
           while (IsIdentifierStart(*cursor_) || is_digit(*cursor_)) cursor_++;
           attribute_.append(start, cursor_);
-          token_ = has_sign ? kTokenStringConstant : kTokenIdentifier;
+          token_ = kTokenIdentifier;
+          return NoError();
+        }
+
+        const auto has_sign = (c == '+') || (c == '-');
+        if (has_sign && IsIdentifierStart(*cursor_)) {
+          // '-'/'+' and following identifier - it could be a predefined
+          // constant. Return the sign in token_, see ParseSingleValue.
           return NoError();
         }
 
@@ -576,17 +602,18 @@ CheckedError Parser::ParseNamespacing(std::string *id, std::string *last) {
 
 EnumDef *Parser::LookupEnum(const std::string &id) {
   // Search thru parent namespaces.
-  for (int components = static_cast<int>(current_namespace_->components.size());
-       components >= 0; components--) {
-    auto ed = enums_.Lookup(
-        current_namespace_->GetFullyQualifiedName(id, components));
-    if (ed) return ed;
-  }
-  return nullptr;
+  return LookupTableByName(enums_, id, *current_namespace_, 0);
 }
 
 StructDef *Parser::LookupStruct(const std::string &id) const {
   auto sd = structs_.Lookup(id);
+  if (sd) sd->refcount++;
+  return sd;
+}
+
+StructDef *Parser::LookupStructThruParentNamespaces(
+    const std::string &id) const {
+  auto sd = LookupTableByName(structs_, id, *current_namespace_, 1);
   if (sd) sd->refcount++;
   return sd;
 }
@@ -771,38 +798,19 @@ CheckedError Parser::ParseField(StructDef &struct_def) {
   if (token_ == '=') {
     NEXT();
     ECHECK(ParseSingleValue(&field->name, field->value, true));
-    if (!IsScalar(type.base_type) ||
-        (struct_def.fixed && field->value.constant != "0"))
+    if (IsStruct(type) || (struct_def.fixed && field->value.constant != "0"))
       return Error(
-          "default values currently only supported for scalars in tables");
-  }
-
-  // Mark the optional scalars. Note that a side effect of ParseSingleValue is
-  // fixing field->value.constant to null.
-  if (IsScalar(type.base_type)) {
-    field->optional = (field->value.constant == "null");
-    if (field->optional) {
-      if (type.enum_def && type.enum_def->Lookup("null")) {
-        FLATBUFFERS_ASSERT(IsInteger(type.base_type));
-        return Error(
-            "the default 'null' is reserved for declaring optional scalar "
-            "fields, it conflicts with declaration of enum '" +
-            type.enum_def->name + "'.");
-      }
-      if (field->attributes.Lookup("key")) {
-        return Error(
-            "only a non-optional scalar field can be used as a 'key' field");
-      }
-      if (!SupportsOptionalScalars()) {
-        return Error(
-            "Optional scalars are not yet supported in at least one the of "
-            "the specified programming languages.");
-      }
+          "default values are not supported for struct fields, table fields, "
+          "or in structs.");
+    if ((IsString(type) || IsVector(type)) && field->value.constant != "0" &&
+        field->value.constant != "null" && !SupportsDefaultVectorsAndStrings())
+      return Error(
+          "Default values for strings and vectors are not supported in one of "
+          "the specified programming languages");
+    if (IsVector(type) && field->value.constant != "0" &&
+        field->value.constant != "[]") {
+      return Error("The only supported default for vectors is `[]`.");
     }
-  } else {
-    // For nonscalars, only required fields are non-optional.
-    // At least until https://github.com/google/flatbuffers/issues/6053
-    field->optional = !field->required;
   }
 
   // Append .0 if the value has not it (skip hex and scientific floats).
@@ -818,27 +826,6 @@ CheckedError Parser::ParseField(StructDef &struct_def) {
     if ((false == IsIdentifierStart(*s)) &&
         (std::string::npos == field->value.constant.find_first_of(".eEpP"))) {
       field->value.constant += ".0";
-    }
-  }
-  if (type.enum_def) {
-    // The type.base_type can only be scalar, union, array or vector.
-    // Table, struct or string can't have enum_def.
-    // Default value of union and vector in NONE, NULL translated to "0".
-    FLATBUFFERS_ASSERT(IsInteger(type.base_type) ||
-                       (type.base_type == BASE_TYPE_UNION) || IsVector(type) ||
-                       IsArray(type));
-    if (IsVector(type)) {
-      // Vector can't use initialization list.
-      FLATBUFFERS_ASSERT(field->value.constant == "0");
-    } else {
-      // All unions should have the NONE ("0") enum value.
-      auto in_enum = type.enum_def->attributes.Lookup("bit_flags") ||
-                     field->IsScalarOptional() ||
-                     type.enum_def->FindByValue(field->value.constant);
-      if (false == in_enum)
-        return Error("default value of " + field->value.constant +
-                     " for field " + name + " is not part of enum " +
-                     type.enum_def->name);
     }
   }
 
@@ -875,6 +862,78 @@ CheckedError Parser::ParseField(StructDef &struct_def) {
             "hashing.");
     }
   }
+
+  // For historical convenience reasons, string keys are assumed required.
+  // Scalars are kDefault unless otherwise specified.
+  // Nonscalars are kOptional unless required;
+  field->key = field->attributes.Lookup("key") != nullptr;
+  const bool required = field->attributes.Lookup("required") != nullptr ||
+                        (IsString(type) && field->key);
+  const bool default_str_or_vec =
+      ((IsString(type) || IsVector(type)) && field->value.constant != "0");
+  const bool optional = IsScalar(type.base_type)
+                            ? (field->value.constant == "null")
+                            : !(required || default_str_or_vec);
+  if (required && optional) {
+    return Error("Fields cannot be both optional and required.");
+  }
+  field->presence = FieldDef::MakeFieldPresence(optional, required);
+
+  if (required && (struct_def.fixed || IsScalar(type.base_type))) {
+    return Error("only non-scalar fields in tables may be 'required'");
+  }
+  if (field->key) {
+    if (struct_def.has_key) return Error("only one field may be set as 'key'");
+    struct_def.has_key = true;
+    if (!IsScalar(type.base_type) && !IsString(type)) {
+      return Error("'key' field must be string or scalar type");
+    }
+  }
+
+  if (field->IsScalarOptional()) {
+    if (type.enum_def && type.enum_def->Lookup("null")) {
+      FLATBUFFERS_ASSERT(IsInteger(type.base_type));
+      return Error(
+          "the default 'null' is reserved for declaring optional scalar "
+          "fields, it conflicts with declaration of enum '" +
+          type.enum_def->name + "'.");
+    }
+    if (field->attributes.Lookup("key")) {
+      return Error(
+          "only a non-optional scalar field can be used as a 'key' field");
+    }
+    if (!SupportsOptionalScalars()) {
+      return Error(
+          "Optional scalars are not yet supported in at least one the of "
+          "the specified programming languages.");
+    }
+  }
+
+  if (type.enum_def) {
+    // The type.base_type can only be scalar, union, array or vector.
+    // Table, struct or string can't have enum_def.
+    // Default value of union and vector in NONE, NULL translated to "0".
+    FLATBUFFERS_ASSERT(IsInteger(type.base_type) ||
+                       (type.base_type == BASE_TYPE_UNION) || IsVector(type) ||
+                       IsArray(type));
+    if (IsVector(type)) {
+      // Vector can't use initialization list.
+      FLATBUFFERS_ASSERT(field->value.constant == "0");
+    } else {
+      // All unions should have the NONE ("0") enum value.
+      auto in_enum = field->IsOptional() ||
+                     type.enum_def->attributes.Lookup("bit_flags") ||
+                     type.enum_def->FindByValue(field->value.constant);
+      if (false == in_enum)
+        return Error("default value of " + field->value.constant +
+                     " for field " + name + " is not part of enum " +
+                     type.enum_def->name);
+    }
+  }
+
+  if (field->deprecated && struct_def.fixed)
+    return Error("can't deprecate fields in a struct");
+
   auto cpp_type = field->attributes.Lookup("cpp_type");
   if (cpp_type) {
     if (!hash_name)
@@ -888,28 +947,7 @@ CheckedError Parser::ParseField(StructDef &struct_def) {
       field->attributes.Add("cpp_ptr_type", val);
     }
   }
-  if (field->deprecated && struct_def.fixed)
-    return Error("can't deprecate fields in a struct");
-  field->required = field->attributes.Lookup("required") != nullptr;
-  if (field->required && (struct_def.fixed || IsScalar(type.base_type)))
-    return Error("only non-scalar fields in tables may be 'required'");
 
-  if (!IsScalar(type.base_type)) {
-    // For nonscalars, only required fields are non-optional.
-    // At least until https://github.com/google/flatbuffers/issues/6053
-    field->optional = !field->required;
-  }
-
-  field->key = field->attributes.Lookup("key") != nullptr;
-  if (field->key) {
-    if (struct_def.has_key) return Error("only one field may be set as 'key'");
-    struct_def.has_key = true;
-    if (!IsScalar(type.base_type)) {
-      field->required = true;
-      if (type.base_type != BASE_TYPE_STRING)
-        return Error("'key' field must be string or scalar type");
-    }
-  }
   field->shared = field->attributes.Lookup("shared") != nullptr;
   if (field->shared && field->value.type.base_type != BASE_TYPE_STRING)
     return Error("shared can only be defined on strings");
@@ -948,7 +986,7 @@ CheckedError Parser::ParseField(StructDef &struct_def) {
   if (typefield) {
     if (!IsScalar(typefield->value.type.base_type)) {
       // this is a union vector field
-      typefield->required = field->required;
+      typefield->presence = field->presence;
     }
     // If this field is a union, and it has a manually assigned id,
     // the automatically added type field should have an id as well (of N - 1).
@@ -1243,7 +1281,7 @@ CheckedError Parser::ParseTable(const StructDef &struct_def, std::string *value,
   for (auto field_it = struct_def.fields.vec.begin();
        field_it != struct_def.fields.vec.end(); ++field_it) {
     auto required_field = *field_it;
-    if (!required_field->required) { continue; }
+    if (!required_field->IsRequired()) { continue; }
     bool found = false;
     for (auto pf_it = field_stack_.end() - fieldn_outer;
          pf_it != field_stack_.end(); ++pf_it) {
@@ -1275,7 +1313,7 @@ CheckedError Parser::ParseTable(const StructDef &struct_def, std::string *value,
       if (!struct_def.sortbysize ||
           size == SizeOf(field_value.type.base_type)) {
         switch (field_value.type.base_type) {
-// clang-format off
+          // clang-format off
           #define FLATBUFFERS_TD(ENUM, IDLTYPE, CTYPE, ...) \
             case BASE_TYPE_ ## ENUM: \
               builder_.Pad(field->padding); \
@@ -1436,6 +1474,23 @@ void SimpleQsort(T *begin, T *end, size_t width, F comparator, S swapper) {
   SimpleQsort(r, end, width, comparator, swapper);
 }
 
+CheckedError Parser::ParseAlignAttribute(const std::string &align_constant,
+                                         size_t min_align, size_t *align) {
+  // Use uint8_t to avoid problems with size_t==`unsigned long` on LP64.
+  uint8_t align_value;
+  if (StringToNumber(align_constant.c_str(), &align_value) &&
+      VerifyAlignmentRequirements(static_cast<size_t>(align_value),
+                                  min_align)) {
+    *align = align_value;
+    return NoError();
+  }
+  return Error("unexpected force_align value '" + align_constant +
+               "', alignment must be a power of two integer ranging from the "
+               "type\'s natural alignment " +
+               NumToString(min_align) + " to " +
+               NumToString(FLATBUFFERS_MAX_ALIGNMENT));
+}
+
 CheckedError Parser::ParseVector(const Type &type, uoffset_t *ovalue,
                                  FieldDef *field, size_t fieldn) {
   uoffset_t count = 0;
@@ -1448,20 +1503,21 @@ CheckedError Parser::ParseVector(const Type &type, uoffset_t *ovalue,
   });
   ECHECK(err);
 
-  const auto *force_align = field->attributes.Lookup("force_align");
-  const size_t align =
-      force_align ? static_cast<size_t>(atoi(force_align->constant.c_str()))
-                  : 1;
   const size_t len = count * InlineSize(type) / InlineAlignment(type);
   const size_t elemsize = InlineAlignment(type);
-  if (align > 1) { builder_.ForceVectorAlignment(len, elemsize, align); }
+  const auto force_align = field->attributes.Lookup("force_align");
+  if (force_align) {
+    size_t align;
+    ECHECK(ParseAlignAttribute(force_align->constant, 1, &align));
+    if (align > 1) { builder_.ForceVectorAlignment(len, elemsize, align); }
+  }
 
   builder_.StartVector(len, elemsize);
   for (uoffset_t i = 0; i < count; i++) {
     // start at the back, since we're building the data backwards.
     auto &val = field_stack_.back().first;
     switch (val.type.base_type) {
-// clang-format off
+      // clang-format off
       #define FLATBUFFERS_TD(ENUM, IDLTYPE, CTYPE,...) \
         case BASE_TYPE_ ## ENUM: \
           if (IsStruct(val.type)) SerializeStruct(*val.type.struct_def, val); \
@@ -1800,56 +1856,61 @@ CheckedError Parser::ParseFunction(const std::string *name, Value &e) {
 CheckedError Parser::TryTypedValue(const std::string *name, int dtoken,
                                    bool check, Value &e, BaseType req,
                                    bool *destmatch) {
-  bool match = dtoken == token_;
-  if (match) {
-    FLATBUFFERS_ASSERT(*destmatch == false);
-    *destmatch = true;
-    e.constant = attribute_;
-    // Check token match
-    if (!check) {
-      if (e.type.base_type == BASE_TYPE_NONE) {
-        e.type.base_type = req;
-      } else {
-        return Error(
-            std::string("type mismatch: expecting: ") +
-            kTypeNames[e.type.base_type] + ", found: " + kTypeNames[req] +
-            ", name: " + (name ? *name : "") + ", value: " + e.constant);
-      }
+  FLATBUFFERS_ASSERT(*destmatch == false && dtoken == token_);
+  *destmatch = true;
+  e.constant = attribute_;
+  // Check token match
+  if (!check) {
+    if (e.type.base_type == BASE_TYPE_NONE) {
+      e.type.base_type = req;
+    } else {
+      return Error(std::string("type mismatch: expecting: ") +
+                   kTypeNames[e.type.base_type] +
+                   ", found: " + kTypeNames[req] +
+                   ", name: " + (name ? *name : "") + ", value: " + e.constant);
     }
-    // The exponent suffix of hexadecimal float-point number is mandatory.
-    // A hex-integer constant is forbidden as an initializer of float number.
-    if ((kTokenFloatConstant != dtoken) && IsFloat(e.type.base_type)) {
-      const auto &s = e.constant;
-      const auto k = s.find_first_of("0123456789.");
-      if ((std::string::npos != k) && (s.length() > (k + 1)) &&
-          (s[k] == '0' && is_alpha_char(s[k + 1], 'X')) &&
-          (std::string::npos == s.find_first_of("pP", k + 2))) {
-        return Error(
-            "invalid number, the exponent suffix of hexadecimal "
-            "floating-point literals is mandatory: \"" +
-            s + "\"");
-      }
-    }
-    NEXT();
   }
+  // The exponent suffix of hexadecimal float-point number is mandatory.
+  // A hex-integer constant is forbidden as an initializer of float number.
+  if ((kTokenFloatConstant != dtoken) && IsFloat(e.type.base_type)) {
+    const auto &s = e.constant;
+    const auto k = s.find_first_of("0123456789.");
+    if ((std::string::npos != k) && (s.length() > (k + 1)) &&
+        (s[k] == '0' && is_alpha_char(s[k + 1], 'X')) &&
+        (std::string::npos == s.find_first_of("pP", k + 2))) {
+      return Error(
+          "invalid number, the exponent suffix of hexadecimal "
+          "floating-point literals is mandatory: \"" +
+          s + "\"");
+    }
+  }
+  NEXT();
   return NoError();
 }
 
 CheckedError Parser::ParseSingleValue(const std::string *name, Value &e,
                                       bool check_now) {
+  if (token_ == '+' || token_ == '-') {
+    const char sign = static_cast<char>(token_);
+    // Get an indentifier: NAN, INF, or function name like cos/sin/deg.
+    NEXT();
+    if (token_ != kTokenIdentifier) return Error("constant name expected");
+    attribute_.insert(0, 1, sign);
+  }
+
   const auto in_type = e.type.base_type;
   const auto is_tok_ident = (token_ == kTokenIdentifier);
   const auto is_tok_string = (token_ == kTokenStringConstant);
 
-  // First see if this could be a conversion function:
+  // First see if this could be a conversion function.
   if (is_tok_ident && *cursor_ == '(') { return ParseFunction(name, e); }
 
   // clang-format off
   auto match = false;
 
   #define IF_ECHECK_(force, dtoken, check, req)    \
-    if (!match && ((check) || IsConstTrue(force))) \
-    ECHECK(TryTypedValue(name, dtoken, check, e, req, &match))
+    if (!match && ((dtoken) == token_) && ((check) || IsConstTrue(force))) \
+      ECHECK(TryTypedValue(name, dtoken, check, e, req, &match))
   #define TRY_ECHECK(dtoken, check, req) IF_ECHECK_(false, dtoken, check, req)
   #define FORCE_ECHECK(dtoken, check, req) IF_ECHECK_(true, dtoken, check, req)
   // clang-format on
@@ -1922,6 +1983,15 @@ CheckedError Parser::ParseSingleValue(const std::string *name, Value &e,
     // Integer token can init any scalar (integer of float).
     FORCE_ECHECK(kTokenIntegerConstant, IsScalar(in_type), BASE_TYPE_INT);
   }
+  // Match empty vectors for default-empty-vectors.
+  if (!match && IsVector(e.type) && token_ == '[') {
+    NEXT();
+    if (token_ != ']') { return Error("Expected `]` in vector default"); }
+    NEXT();
+    match = true;
+    e.constant = "[]";
+  }
+
 #undef FORCE_ECHECK
 #undef TRY_ECHECK
 #undef IF_ECHECK_
@@ -1979,13 +2049,8 @@ StructDef *Parser::LookupCreateStruct(const std::string &name,
     }
     return struct_def;
   }
-  if (!definition) {
-    // Search thru parent namespaces.
-    for (size_t components = current_namespace_->components.size();
-         components && !struct_def; components--) {
-      struct_def = LookupStruct(
-          current_namespace_->GetFullyQualifiedName(name, components - 1));
-    }
+  if (!definition && !struct_def) {
+    struct_def = LookupStructThruParentNamespaces(name);
   }
   if (!struct_def && create_if_new) {
     struct_def = new StructDef();
@@ -2367,24 +2432,27 @@ bool Parser::SupportsOptionalScalars(const flatbuffers::IDLOptions &opts) {
   static FLATBUFFERS_CONSTEXPR unsigned long supported_langs =
       IDLOptions::kRust | IDLOptions::kSwift | IDLOptions::kLobster |
       IDLOptions::kKotlin | IDLOptions::kCpp | IDLOptions::kJava |
-      IDLOptions::kCSharp | IDLOptions::kTs | IDLOptions::kJs |
-      IDLOptions::kBinary;
+      IDLOptions::kCSharp | IDLOptions::kTs | IDLOptions::kBinary;
   unsigned long langs = opts.lang_to_generate;
   return (langs > 0 && langs < IDLOptions::kMAX) && !(langs & ~supported_langs);
 }
-
 bool Parser::SupportsOptionalScalars() const {
   // Check in general if a language isn't specified.
   return opts.lang_to_generate == 0 || SupportsOptionalScalars(opts);
 }
 
+bool Parser::SupportsDefaultVectorsAndStrings() const {
+  static FLATBUFFERS_CONSTEXPR unsigned long supported_langs =
+      IDLOptions::kRust | IDLOptions::kSwift;
+  return !(opts.lang_to_generate & ~supported_langs);
+}
+
 bool Parser::SupportsAdvancedUnionFeatures() const {
   return opts.lang_to_generate != 0 &&
          (opts.lang_to_generate &
-          ~(IDLOptions::kCpp | IDLOptions::kJs | IDLOptions::kTs |
-            IDLOptions::kPhp | IDLOptions::kJava | IDLOptions::kCSharp |
-            IDLOptions::kKotlin | IDLOptions::kBinary | IDLOptions::kSwift)) ==
-             0;
+          ~(IDLOptions::kCpp | IDLOptions::kTs | IDLOptions::kPhp |
+            IDLOptions::kJava | IDLOptions::kCSharp | IDLOptions::kKotlin |
+            IDLOptions::kBinary | IDLOptions::kSwift)) == 0;
 }
 
 bool Parser::SupportsAdvancedArrayFeatures() const {
@@ -2442,17 +2510,12 @@ CheckedError Parser::ParseDecl() {
       struct_def->attributes.Lookup("original_order") == nullptr && !fixed;
   EXPECT('{');
   while (token_ != '}') ECHECK(ParseField(*struct_def));
-  auto force_align = struct_def->attributes.Lookup("force_align");
   if (fixed) {
+    const auto force_align = struct_def->attributes.Lookup("force_align");
     if (force_align) {
-      auto align = static_cast<size_t>(atoi(force_align->constant.c_str()));
-      if (force_align->type.base_type != BASE_TYPE_INT ||
-          align < struct_def->minalign || align > FLATBUFFERS_MAX_ALIGNMENT ||
-          align & (align - 1))
-        return Error(
-            "force_align must be a power of two integer ranging from the"
-            "struct\'s natural alignment to " +
-            NumToString(FLATBUFFERS_MAX_ALIGNMENT));
+      size_t align;
+      ECHECK(ParseAlignAttribute(force_align->constant, struct_def->minalign,
+                                 &align));
       struct_def->minalign = align;
     }
     if (!struct_def->bytesize) return Error("size 0 structs not allowed");
@@ -2775,7 +2838,9 @@ CheckedError Parser::ParseProtoFields(StructDef *struct_def, bool isextend,
       }
       if (!field) ECHECK(AddField(*struct_def, name, type, &field));
       field->doc_comment = field_comment;
-      if (!IsScalar(type.base_type)) field->required = required;
+      if (!IsScalar(type.base_type) && required) {
+        field->presence = FieldDef::kRequired;
+      }
       // See if there's a default specified.
       if (Is('[')) {
         NEXT();
@@ -2944,6 +3009,15 @@ CheckedError Parser::SkipAnyJsonValue() {
   return NoError();
 }
 
+CheckedError Parser::ParseFlexBufferNumericConstant(
+    flexbuffers::Builder *builder) {
+  double d;
+  if (!StringToNumber(attribute_.c_str(), &d))
+    return Error("unexpected floating-point constant: " + attribute_);
+  builder->Double(d);
+  return NoError();
+}
+
 CheckedError Parser::ParseFlexBufferValue(flexbuffers::Builder *builder) {
   ParseDepthGuard depth_guard(this);
   ECHECK(depth_guard.Check());
@@ -2991,6 +3065,18 @@ CheckedError Parser::ParseFlexBufferValue(flexbuffers::Builder *builder) {
       EXPECT(kTokenFloatConstant);
       break;
     }
+    case '-':
+    case '+': {
+      // `[-+]?(nan|inf|infinity)`, see ParseSingleValue().
+      const auto sign = static_cast<char>(token_);
+      NEXT();
+      if (token_ != kTokenIdentifier)
+        return Error("floating-point constant expected");
+      attribute_.insert(0, 1, sign);
+      ECHECK(ParseFlexBufferNumericConstant(builder));
+      NEXT();
+      break;
+    }
     default:
       if (IsIdent("true")) {
         builder->Bool(true);
@@ -3000,6 +3086,9 @@ CheckedError Parser::ParseFlexBufferValue(flexbuffers::Builder *builder) {
         NEXT();
       } else if (IsIdent("null")) {
         builder->Null();
+        NEXT();
+      } else if (IsIdent("inf") || IsIdent("infinity") || IsIdent("nan")) {
+        ECHECK(ParseFlexBufferNumericConstant(builder));
         NEXT();
       } else
         return TokenError();
@@ -3133,16 +3222,38 @@ CheckedError Parser::ParseRoot(const char *source, const char **include_paths,
       }
     }
   }
+  // Parse JSON object only if the scheme has been parsed.
+  if (token_ == '{') { ECHECK(DoParseJson()); }
+  EXPECT(kTokenEof);
   return NoError();
+}
+
+// Generate a unique hash for a file based on its name and contents (if any).
+static uint64_t HashFile(const char *source_filename, const char *source) {
+  uint64_t hash = 0;
+
+  if (source_filename)
+    hash = HashFnv1a<uint64_t>(StripPath(source_filename).c_str());
+
+  if (source && *source) hash ^= HashFnv1a<uint64_t>(source);
+
+  return hash;
 }
 
 CheckedError Parser::DoParse(const char *source, const char **include_paths,
                              const char *source_filename,
                              const char *include_filename) {
+  uint64_t source_hash = 0;
   if (source_filename) {
-    if (included_files_.find(source_filename) == included_files_.end()) {
-      included_files_[source_filename] =
-          include_filename ? include_filename : "";
+    // If the file is in-memory, don't include its contents in the hash as we
+    // won't be able to load them later.
+    if (FileExists(source_filename))
+      source_hash = HashFile(source_filename, source);
+    else
+      source_hash = HashFile(source_filename, nullptr);
+
+    if (included_files_.find(source_hash) == included_files_.end()) {
+      included_files_[source_hash] = include_filename ? include_filename : "";
       files_included_per_file_[source_filename] = std::set<std::string>();
     } else {
       return NoError();
@@ -3175,22 +3286,32 @@ CheckedError Parser::DoParse(const char *source, const char **include_paths,
       if (opts.proto_mode && attribute_ == "public") NEXT();
       auto name = flatbuffers::PosixPath(attribute_.c_str());
       EXPECT(kTokenStringConstant);
-      // Look for the file in include_paths.
+      // Look for the file relative to the directory of the current file.
       std::string filepath;
-      for (auto paths = include_paths; paths && *paths; paths++) {
-        filepath = flatbuffers::ConCatPathFileName(*paths, name);
-        if (FileExists(filepath.c_str())) break;
+      if (source_filename) {
+        auto source_file_directory =
+            flatbuffers::StripFileName(source_filename);
+        filepath = flatbuffers::ConCatPathFileName(source_file_directory, name);
+      }
+      if (filepath.empty() || !FileExists(filepath.c_str())) {
+        // Look for the file in include_paths.
+        for (auto paths = include_paths; paths && *paths; paths++) {
+          filepath = flatbuffers::ConCatPathFileName(*paths, name);
+          if (FileExists(filepath.c_str())) break;
+        }
       }
       if (filepath.empty())
         return Error("unable to locate include file: " + name);
       if (source_filename)
         files_included_per_file_[source_filename].insert(filepath);
-      if (included_files_.find(filepath) == included_files_.end()) {
+
+      std::string contents;
+      bool file_loaded = LoadFile(filepath.c_str(), true, &contents);
+      if (included_files_.find(HashFile(filepath.c_str(), contents.c_str())) ==
+          included_files_.end()) {
         // We found an include file that we have not parsed yet.
-        // Load it and parse it.
-        std::string contents;
-        if (!LoadFile(filepath.c_str(), true, &contents))
-          return Error("unable to load include file: " + name);
+        // Parse it.
+        if (!file_loaded) return Error("unable to load include file: " + name);
         ECHECK(DoParse(contents.c_str(), include_paths, filepath.c_str(),
                        name.c_str()));
         // We generally do not want to output code for any included files:
@@ -3207,7 +3328,7 @@ CheckedError Parser::DoParse(const char *source, const char **include_paths,
         // entered into included_files_.
         // This is recursive, but only go as deep as the number of include
         // statements.
-        if (source_filename) { included_files_.erase(source_filename); }
+        included_files_.erase(source_hash);
         return DoParse(source, include_paths, source_filename,
                        include_filename);
       }
@@ -3223,7 +3344,7 @@ CheckedError Parser::DoParse(const char *source, const char **include_paths,
     } else if (IsIdent("namespace")) {
       ECHECK(ParseNamespace());
     } else if (token_ == '{') {
-      ECHECK(DoParseJson());
+      return NoError();
     } else if (IsIdent("enum")) {
       ECHECK(ParseEnum(false, nullptr));
     } else if (IsIdent("union")) {
@@ -3274,13 +3395,11 @@ CheckedError Parser::DoParse(const char *source, const char **include_paths,
   return NoError();
 }
 
-CheckedError Parser::DoParseJson()
-{
+CheckedError Parser::DoParseJson() {
   if (token_ != '{') {
     EXPECT('{');
   } else {
-    if (!root_struct_def_)
-      return Error("no root type set to parse json with");
+    if (!root_struct_def_) return Error("no root type set to parse json with");
     if (builder_.GetSize()) {
       return Error("cannot have more than one json object in a file");
     }
@@ -3292,8 +3411,8 @@ CheckedError Parser::DoParseJson()
           file_identifier_.length() ? file_identifier_.c_str() : nullptr);
     } else {
       builder_.Finish(Offset<Table>(toff), file_identifier_.length()
-                                                ? file_identifier_.c_str()
-                                                : nullptr);
+                                               ? file_identifier_.c_str()
+                                               : nullptr);
     }
   }
   // Check that JSON file doesn't contain more objects or IDL directives.
@@ -3474,8 +3593,8 @@ Offset<reflection::Field> FieldDef::Serialize(FlatBufferBuilder *builder,
       // Is uint64>max(int64) tested?
       IsInteger(value.type.base_type) ? StringToInt(value.constant.c_str()) : 0,
       // result may be platform-dependent if underlying is float (not double)
-      IsFloat(value.type.base_type) ? d : 0.0, deprecated, required, key,
-      attr__, docs__, optional);
+      IsFloat(value.type.base_type) ? d : 0.0, deprecated, IsRequired(), key,
+      attr__, docs__, IsOptional());
   // TODO: value.constant is almost always "0", we could save quite a bit of
   // space by sharing it. Same for common values of value.type.
 }
@@ -3490,8 +3609,7 @@ bool FieldDef::Deserialize(Parser &parser, const reflection::Field *field) {
   } else if (IsFloat(value.type.base_type)) {
     value.constant = FloatToString(field->default_real(), 16);
   }
-  deprecated = field->deprecated();
-  required = field->required();
+  presence = FieldDef::MakeFieldPresence(field->optional(), field->required());
   key = field->key();
   if (!DeserializeAttributes(parser, field->attributes())) return false;
   // TODO: this should probably be handled by a separate attribute

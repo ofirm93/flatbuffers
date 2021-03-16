@@ -654,7 +654,7 @@ class JavaGenerator : public BaseGenerator {
       std::string src_cast = SourceCast(field.value.type);
       std::string method_start =
           "  public " +
-          (field.required ? "" : GenNullableAnnotation(field.value.type)) +
+          (field.IsRequired() ? "" : GenNullableAnnotation(field.value.type)) +
           GenPureAnnotation(field.value.type) + type_name_dest + optional +
           " " + MakeCamel(field.name, false);
       std::string obj = "obj";
@@ -1071,7 +1071,7 @@ class JavaGenerator : public BaseGenerator {
               code += "create";
               code += MakeCamel(field.name);
               code += "Vector(FlatBufferBuilder builder, ";
-              code += GenTypeBasic(vector_type) + "[] data) ";
+              code += GenTypeBasic(DestinationType(vector_type, false)) + "[] data) ";
               code += "{ builder.startVector(";
               code += NumToString(elem_size);
               code += ", data.length, ";
@@ -1081,8 +1081,8 @@ class JavaGenerator : public BaseGenerator {
               code += "add";
               code += GenMethod(vector_type);
               code += "(";
-              code += SourceCastBasic(vector_type, false);
-              code += "data[i]";
+              code += SourceCastBasic(vector_type);
+              code += " data[i]";
               code += "); return ";
               code += "builder.endVector(); }\n";
             }
@@ -1105,7 +1105,7 @@ class JavaGenerator : public BaseGenerator {
       for (auto it = struct_def.fields.vec.begin();
            it != struct_def.fields.vec.end(); ++it) {
         auto &field = **it;
-        if (!field.deprecated && field.required) {
+        if (!field.deprecated && field.IsRequired()) {
           code += "    builder.required(o, ";
           code += NumToString(field.value.offset);
           code += ");  // " + field.name + "\n";

@@ -204,7 +204,6 @@ flatbuffers::DetachedBuffer CreateFlatBufferTest(std::string &buffer) {
   flexbuild.Int(1234);
   flexbuild.Finish();
   auto flex = builder.CreateVector(flexbuild.GetBuffer());
-
   // Test vector of enums.
   Color colors[] = { Color_Blue, Color_Green };
   // We use this special creation function because we have an array of
@@ -697,7 +696,7 @@ template<typename T, typename U, U qnan_base> bool is_quiet_nan_impl(T v) {
   std::memcpy(&b, &v, sizeof(T));
   return ((b & qnan_base) == qnan_base);
 }
-#if defined(__mips__) || defined(__hppa__)
+#  if defined(__mips__) || defined(__hppa__)
 static bool is_quiet_nan(float v) {
   return is_quiet_nan_impl<float, uint32_t, 0x7FC00000u>(v) ||
          is_quiet_nan_impl<float, uint32_t, 0x7FBFFFFFu>(v);
@@ -706,14 +705,14 @@ static bool is_quiet_nan(double v) {
   return is_quiet_nan_impl<double, uint64_t, 0x7FF8000000000000ul>(v) ||
          is_quiet_nan_impl<double, uint64_t, 0x7FF7FFFFFFFFFFFFu>(v);
 }
-#else
+#  else
 static bool is_quiet_nan(float v) {
   return is_quiet_nan_impl<float, uint32_t, 0x7FC00000u>(v);
 }
 static bool is_quiet_nan(double v) {
   return is_quiet_nan_impl<double, uint64_t, 0x7FF8000000000000ul>(v);
 }
-#endif
+#  endif
 
 void TestMonsterExtraFloats() {
   TEST_EQ(is_quiet_nan(1.0), false);
@@ -1645,7 +1644,6 @@ void ErrorTest() {
   TestError("table X { Y:int; Y:int; }", "field already");
   TestError("table Y {} table X { Y:int; }", "same as table");
   TestError("struct X { Y:string; }", "only scalar");
-  TestError("table X { Y:string = \"\"; }", "default values");
   TestError("struct X { a:uint = 42; }", "default values");
   TestError("enum Y:byte { Z = 1 } table X { y:Y; }", "not part of enum");
   TestError("struct X { Y:int (deprecated); }", "deprecate");
@@ -1690,6 +1688,15 @@ void ErrorTest() {
             "may contain only scalar or struct fields");
   // Non-snake case field names
   TestError("table X { Y: int; } root_type Y: {Y:1.0}", "snake_case");
+  // Complex defaults
+  TestError("table X { y: string = 1; }", "expecting: string");
+  TestError("table X { y: string = []; }", " Cannot assign token");
+  TestError("table X { y: [int] = [1]; }", "Expected `]`");
+  TestError("table X { y: [int] = [; }", "Expected `]`");
+  TestError("table X { y: [int] = \"\"; }", "type mismatch");
+  // An identifier can't start from sign (+|-)
+  TestError("table X { -Y: int; } root_type Y: {Y:1.0}", "identifier");
+  TestError("table X { +Y: int; } root_type Y: {Y:1.0}", "identifier");
 }
 
 template<typename T>
@@ -2024,6 +2031,8 @@ void ValidFloatTest() {
   TEST_EQ(std::isnan(TestValue<double>("{ y:nan }", "double")), true);
   TEST_EQ(std::isnan(TestValue<float>("{ y:nan }", "float")), true);
   TEST_EQ(std::isnan(TestValue<float>("{ y:\"nan\" }", "float")), true);
+  TEST_EQ(std::isnan(TestValue<float>("{ y:\"+nan\" }", "float")), true);
+  TEST_EQ(std::isnan(TestValue<float>("{ y:\"-nan\" }", "float")), true);
   TEST_EQ(std::isnan(TestValue<float>("{ y:+nan }", "float")), true);
   TEST_EQ(std::isnan(TestValue<float>("{ y:-nan }", "float")), true);
   TEST_EQ(std::isnan(TestValue<float>(nullptr, "float=nan")), true);
@@ -2031,6 +2040,8 @@ void ValidFloatTest() {
   // check inf
   TEST_EQ(TestValue<float>("{ y:inf }", "float"), infinity_f);
   TEST_EQ(TestValue<float>("{ y:\"inf\" }", "float"), infinity_f);
+  TEST_EQ(TestValue<float>("{ y:\"-inf\" }", "float"), -infinity_f);
+  TEST_EQ(TestValue<float>("{ y:\"+inf\" }", "float"), infinity_f);
   TEST_EQ(TestValue<float>("{ y:+inf }", "float"), infinity_f);
   TEST_EQ(TestValue<float>("{ y:-inf }", "float"), -infinity_f);
   TEST_EQ(TestValue<float>(nullptr, "float=inf"), infinity_f);
@@ -3009,6 +3020,31 @@ void FlexBuffersTest() {
   TEST_EQ(slb.GetSize(), 664);
 }
 
+void FlexBuffersFloatingPointTest() {
+#if defined(FLATBUFFERS_HAS_NEW_STRTOD) && (FLATBUFFERS_HAS_NEW_STRTOD > 0)
+  flexbuffers::Builder slb(512,
+                           flexbuffers::BUILDER_FLAG_SHARE_KEYS_AND_STRINGS);
+  // Parse floating-point values from JSON:
+  flatbuffers::Parser parser;
+  slb.Clear();
+  auto jsontest =
+      "{ a: [1.0, nan, inf, infinity, -inf, +inf, -infinity, 8.0] }";
+  TEST_EQ(parser.ParseFlexBuffer(jsontest, nullptr, &slb), true);
+  auto jroot = flexbuffers::GetRoot(slb.GetBuffer());
+  auto jmap = jroot.AsMap();
+  auto jvec = jmap["a"].AsVector();
+  TEST_EQ(8, jvec.size());
+  TEST_EQ(1.0, jvec[0].AsDouble());
+  TEST_ASSERT(is_quiet_nan(jvec[1].AsDouble()));
+  TEST_EQ(infinity_d, jvec[2].AsDouble());
+  TEST_EQ(infinity_d, jvec[3].AsDouble());
+  TEST_EQ(-infinity_d, jvec[4].AsDouble());
+  TEST_EQ(+infinity_d, jvec[5].AsDouble());
+  TEST_EQ(-infinity_d, jvec[6].AsDouble());
+  TEST_EQ(8.0, jvec[7].AsDouble());
+#endif
+}
+
 void FlexBuffersDeprecatedTest() {
   // FlexBuffers as originally designed had a flaw involving the
   // FBT_VECTOR_STRING datatype, and this test documents/tests the fix for it.
@@ -3420,21 +3456,21 @@ void FixedLengthArrayTest() {
   // set memory chunk of size ArrayStruct to 1's
   std::memset(static_cast<void *>(non_zero_memory), 1, arr_size);
   // after placement-new it should be all 0's
-#if defined (_MSC_VER) && defined (_DEBUG)
-  #undef new
-#endif
-  MyGame::Example::ArrayStruct *ap = new (non_zero_memory) MyGame::Example::ArrayStruct;
-#if defined (_MSC_VER) && defined (_DEBUG)
-  #define new DEBUG_NEW
-#endif
+#  if defined(_MSC_VER) && defined(_DEBUG)
+#    undef new
+#  endif
+  MyGame::Example::ArrayStruct *ap =
+      new (non_zero_memory) MyGame::Example::ArrayStruct;
+#  if defined(_MSC_VER) && defined(_DEBUG)
+#    define new DEBUG_NEW
+#  endif
   (void)ap;
-  for (size_t i = 0; i < arr_size; ++i) {
-    TEST_EQ(non_zero_memory[i], 0);
-  }
+  for (size_t i = 0; i < arr_size; ++i) { TEST_EQ(non_zero_memory[i], 0); }
 #endif
 }
 
-#if !defined(FLATBUFFERS_SPAN_MINIMAL) && (!defined(_MSC_VER) || _MSC_VER >= 1700)
+#if !defined(FLATBUFFERS_SPAN_MINIMAL) && \
+    (!defined(_MSC_VER) || _MSC_VER >= 1700)
 void FixedLengthArrayConstructorTest() {
   const int32_t nested_a[2] = { 1, 2 };
   MyGame::Example::TestEnum nested_c[2] = { MyGame::Example::TestEnum::A,
@@ -3481,8 +3517,7 @@ void FixedLengthArrayConstructorTest() {
   TEST_EQ(arr_struct.f()->Get(1), -1);
 }
 #else
-void FixedLengthArrayConstructorTest() {
-}
+void FixedLengthArrayConstructorTest() {}
 #endif
 
 void NativeTypeTest() {
@@ -3621,6 +3656,22 @@ void TestEmbeddedBinarySchema() {
           0);
 }
 
+void StringVectorDefaultsTest() {
+  std::vector<std::string> schemas;
+  schemas.push_back("table Monster { mana: string = \"\"; }");
+  schemas.push_back("table Monster { mana: string = \"mystr\"; }");
+  schemas.push_back("table Monster { mana: string = \"  \"; }");
+  schemas.push_back("table Monster { mana: [int] = []; }");
+  schemas.push_back("table Monster { mana: [uint] = [  ]; }");
+  schemas.push_back("table Monster { mana: [byte] = [\t\t\n]; }");
+  for (auto s = schemas.begin(); s < schemas.end(); s++) {
+    flatbuffers::Parser parser;
+    TEST_ASSERT(parser.Parse(s->c_str()));
+    const auto *mana = parser.structs_.Lookup("Monster")->fields.Lookup("mana");
+    TEST_EQ(mana->IsDefault(), true);
+  }
+}
+
 void OptionalScalarsTest() {
   // Simple schemas and a "has optional scalar" sentinal.
   std::vector<std::string> schemas;
@@ -3639,12 +3690,15 @@ void OptionalScalarsTest() {
   schemas.push_back("table Monster { mana : bool; }");
   schemas.push_back("table Monster { mana : bool = 42; }");
   schemas.push_back("table Monster { mana : bool = null; }");
-  schemas.push_back("enum Enum: int {A=0, B=1} "
-                    "table Monster { mana : Enum; }");
-  schemas.push_back("enum Enum: int {A=0, B=1} "
-                    "table Monster { mana : Enum = B; }");
-  schemas.push_back("enum Enum: int {A=0, B=1} "
-                    "table Monster { mana : Enum = null; }");
+  schemas.push_back(
+      "enum Enum: int {A=0, B=1} "
+      "table Monster { mana : Enum; }");
+  schemas.push_back(
+      "enum Enum: int {A=0, B=1} "
+      "table Monster { mana : Enum = B; }");
+  schemas.push_back(
+      "enum Enum: int {A=0, B=1} "
+      "table Monster { mana : Enum = null; }");
 
   // Check the FieldDef is correctly set.
   for (auto schema = schemas.begin(); schema < schemas.end(); schema++) {
@@ -3652,7 +3706,7 @@ void OptionalScalarsTest() {
     flatbuffers::Parser parser;
     TEST_ASSERT(parser.Parse(schema->c_str()));
     const auto *mana = parser.structs_.Lookup("Monster")->fields.Lookup("mana");
-    TEST_EQ(mana->optional, has_null);
+    TEST_EQ(mana->IsOptional(), has_null);
   }
 
   // Test if nullable scalars are allowed for each language.
@@ -3755,6 +3809,34 @@ void FieldIdentifierTest() {
   // Positive tests for unions
   TEST_EQ(true, Parser().Parse("union X{} table T{ u: X (id:1); }"));
   TEST_EQ(true, Parser().Parse("union X{} table T{ u: X; }"));
+  // Test using 'inf' and 'nan' words both as identifiers and as default values.
+  TEST_EQ(true, Parser().Parse("table T{ nan: string; }"));
+  TEST_EQ(true, Parser().Parse("table T{ inf: string; }"));
+#if defined(FLATBUFFERS_HAS_NEW_STRTOD) && (FLATBUFFERS_HAS_NEW_STRTOD > 0)
+  TEST_EQ(true, Parser().Parse("table T{ inf: float = inf; }"));
+  TEST_EQ(true, Parser().Parse("table T{ nan: float = inf; }"));
+#endif
+}
+
+void ParseIncorrectMonsterJsonTest() {
+  std::string schemafile;
+  TEST_EQ(flatbuffers::LoadFile((test_data_path + "monster_test.bfbs").c_str(),
+                                true, &schemafile),
+          true);
+  flatbuffers::Parser parser;
+  flatbuffers::Verifier verifier(
+      reinterpret_cast<const uint8_t *>(schemafile.c_str()), schemafile.size());
+  TEST_EQ(reflection::VerifySchemaBuffer(verifier), true);
+  TEST_EQ(parser.Deserialize((const uint8_t *)schemafile.c_str(),
+                             schemafile.size()),
+          true);
+  TEST_EQ(parser.ParseJson("{name:\"monster\"}"), true);
+  TEST_EQ(parser.ParseJson(""), false);
+  TEST_EQ(parser.ParseJson("{name: 1}"), false);
+  TEST_EQ(parser.ParseJson("{name:+1}"), false);
+  TEST_EQ(parser.ParseJson("{name:-1}"), false);
+  TEST_EQ(parser.ParseJson("{name:-f}"), false);
+  TEST_EQ(parser.ParseJson("{name:+f}"), false);
 }
 
 int FlatBufferTests() {
@@ -3850,6 +3932,9 @@ int FlatBufferTests() {
   FlatbuffersSpanTest();
   FixedLengthArrayConstructorTest();
   FieldIdentifierTest();
+  StringVectorDefaultsTest();
+  ParseIncorrectMonsterJsonTest();
+  FlexBuffersFloatingPointTest();
   return 0;
 }
 

@@ -98,7 +98,7 @@ set(FlatBuffers_Compiler_SRCS
   src/idl_gen_kotlin.cpp
   src/idl_gen_go.cpp
   src/idl_gen_java.cpp
-  src/idl_gen_js_ts.cpp
+  src/idl_gen_ts.cpp
   src/idl_gen_php.cpp
   src/idl_gen_python.cpp
   src/idl_gen_lobster.cpp
@@ -120,7 +120,6 @@ set(FlatBuffers_Compiler_SRCS
   grpc/src/compiler/java_generator.h
   grpc/src/compiler/java_generator.cc
   grpc/src/compiler/python_generator.h
-  grpc/src/compiler/python_private_generator.h
   grpc/src/compiler/python_generator.cc
   grpc/src/compiler/swift_generator.h
   grpc/src/compiler/swift_generator.cc
@@ -283,6 +282,13 @@ elseif(MSVC)
   # multi-core build.
   add_definitions("/MP")
 endif()
+
+# Append FLATBUFFERS_CXX_FLAGS to CMAKE_CXX_FLAGS.
+if(DEFINED FLATBUFFERS_CXX_FLAGS AND NOT EXISTS "${CMAKE_TOOLCHAIN_FILE}")
+  message(STATUS "extend CXX_FLAGS with ${FLATBUFFERS_CXX_FLAGS}")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${FLATBUFFERS_CXX_FLAGS}")
+endif()
+message(STATUS "CMAKE_CXX_FLAGS: ${CMAKE_CXX_FLAGS}")
 
 if(FLATBUFFERS_CODE_COVERAGE)
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -g -fprofile-arcs -ftest-coverage")
@@ -621,6 +627,14 @@ if(FLATBUFFERS_INSTALL)
       NAMESPACE flatbuffers::
       DESTINATION ${FB_CMAKE_DIR}
     )
+  endif()
+
+  if(FLATBUFFERS_BUILD_SHAREDLIB OR FLATBUFFERS_BUILD_FLATLIB)
+      configure_file(CMake/flatbuffers.pc.in flatbuffers.pc @ONLY)
+      install(
+        FILES "${CMAKE_CURRENT_BINARY_DIR}/flatbuffers.pc"
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig
+      )
   endif()
 endif()
 
