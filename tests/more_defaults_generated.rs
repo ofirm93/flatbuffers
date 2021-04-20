@@ -6,7 +6,7 @@ use std::mem;
 use std::cmp::Ordering;
 
 extern crate flatbuffers;
-use self::flatbuffers::EndianScalar;
+use self::flatbuffers::{EndianScalar, Follow};
 
 #[deprecated(since = "2.0.0", note = "Use associated constants instead. This will no longer be generated in 2021.")]
 pub const ENUM_MIN_ABC: i32 = 0;
@@ -79,6 +79,7 @@ impl flatbuffers::EndianScalar for ABC {
     Self(b)
   }
   #[inline]
+  #[allow(clippy::wrong_self_convention)]
   fn from_little_endian(self) -> Self {
     let b = i32::from_le(self.0);
     Self(b)
